@@ -2421,6 +2421,72 @@ func (kl *Kubelet) handleMissingContainerStatuses(pod *v1.Pod, podStatus *kubeco
 	}
 }
 
+// initializeContainerStatuses builds the initial API container statuses,
+// preserving previously reported state and volume mount information.
+func (kl *Kubelet) initializeContainerStatuses(
+	logger klog.Logger,
+	pod *v1.Pod,
+	containers []v1.Container,
+	oldStatuses map[string]v1.ContainerStatus,
+	hasInitContainers bool,
+) map[string]*v1.ContainerStatus {
+	// Set all container statuses to default waiting state
+	statuses := make(map[string]*v1.ContainerStatus, len(containers))
+	defaultWaitingState := v1.ContainerState{Waiting: &v1.ContainerStateWaiting{Reason: ContainerCreating}}
+	if hasInitContainers {
+		defaultWaitingState = v1.ContainerState{Waiting: &v1.ContainerStateWaiting{Reason: PodInitializing}}
+	}
+
+	supportsRRO := kl.runtimeClassSupportsRecursiveReadOnlyMounts(logger, pod)
+
+	for _, container := range containers {
+		status := &v1.ContainerStatus{
+			Name:  container.Name,
+			Image: container.Image,
+			State: defaultWaitingState,
+		}
+		// status.VolumeMounts cannot be propagated from kubecontainer.Status
+		// because the CRI API is unaware of the volume names.
+		if utilfeature.DefaultFeatureGate.Enabled(features.RecursiveReadOnlyMounts) {
+			for _, vol := range container.VolumeMounts {
+				volStatus := v1.VolumeMountStatus{
+					Name:      vol.Name,
+					MountPath: vol.MountPath,
+					ReadOnly:  vol.ReadOnly,
+				}
+				if vol.ReadOnly {
+					rroMode := v1.RecursiveReadOnlyDisabled
+					if b, err := resolveRecursiveReadOnly(vol, supportsRRO); err != nil {
+						logger.Error(err, "failed to resolve recursive read-only mode", "mode", *vol.RecursiveReadOnly)
+					} else if b {
+						if utilfeature.DefaultFeatureGate.Enabled(features.RecursiveReadOnlyMounts) {
+							rroMode = v1.RecursiveReadOnlyEnabled
+						} else {
+							logger.Error(nil, "recursive read-only mount needs feature gate to be enabled",
+								"featureGate", features.RecursiveReadOnlyMounts)
+						}
+					}
+					volStatus.RecursiveReadOnly = &rroMode // Disabled or Enabled
+				}
+				status.VolumeMounts = append(status.VolumeMounts, volStatus)
+			}
+		}
+		oldStatus, found := oldStatuses[container.Name]
+		if found {
+			if oldStatus.State.Terminated != nil {
+				status = &oldStatus
+			} else {
+				// Apply some values from the old statuses as the default values.
+				status.RestartCount = oldStatus.RestartCount
+				status.LastTerminationState = oldStatus.LastTerminationState
+			}
+		}
+		statuses[container.Name] = status
+	}
+
+	return statuses
+}
+
 // convertToAPIContainerStatuses converts the given internal container
 // statuses into API container statuses.
 func (kl *Kubelet) convertToAPIContainerStatuses(ctx context.Context, pod *v1.Pod, podStatus *kubecontainer.PodStatus, previousStatus []v1.ContainerStatus, containers []v1.Container, imageVolumeNames sets.Set[string], hasInitContainers, isInitContainer bool, podRestarting bool) []v1.ContainerStatus {
@@ -2647,59 +2713,8 @@ func (kl *Kubelet) convertToAPIContainerStatuses(ctx context.Context, pod *v1.Po
 		oldStatuses[status.Name] = status
 	}
 
-	// Set all container statuses to default waiting state
-	statuses := make(map[string]*v1.ContainerStatus, len(containers))
-	defaultWaitingState := v1.ContainerState{Waiting: &v1.ContainerStateWaiting{Reason: ContainerCreating}}
-	if hasInitContainers {
-		defaultWaitingState = v1.ContainerState{Waiting: &v1.ContainerStateWaiting{Reason: PodInitializing}}
-	}
-
-	supportsRRO := kl.runtimeClassSupportsRecursiveReadOnlyMounts(logger, pod)
-
-	for _, container := range containers {
-		status := &v1.ContainerStatus{
-			Name:  container.Name,
-			Image: container.Image,
-			State: defaultWaitingState,
-		}
-		// status.VolumeMounts cannot be propagated from kubecontainer.Status
-		// because the CRI API is unaware of the volume names.
-		if utilfeature.DefaultFeatureGate.Enabled(features.RecursiveReadOnlyMounts) {
-			for _, vol := range container.VolumeMounts {
-				volStatus := v1.VolumeMountStatus{
-					Name:      vol.Name,
-					MountPath: vol.MountPath,
-					ReadOnly:  vol.ReadOnly,
-				}
-				if vol.ReadOnly {
-					rroMode := v1.RecursiveReadOnlyDisabled
-					if b, err := resolveRecursiveReadOnly(vol, supportsRRO); err != nil {
-						logger.Error(err, "failed to resolve recursive read-only mode", "mode", *vol.RecursiveReadOnly)
-					} else if b {
-						if utilfeature.DefaultFeatureGate.Enabled(features.RecursiveReadOnlyMounts) {
-							rroMode = v1.RecursiveReadOnlyEnabled
-						} else {
-							logger.Error(nil, "recursive read-only mount needs feature gate to be enabled",
-								"featureGate", features.RecursiveReadOnlyMounts)
-						}
-					}
-					volStatus.RecursiveReadOnly = &rroMode // Disabled or Enabled
-				}
-				status.VolumeMounts = append(status.VolumeMounts, volStatus)
-			}
-		}
-		oldStatus, found := oldStatuses[container.Name]
-		if found {
-			if oldStatus.State.Terminated != nil {
-				status = &oldStatus
-			} else {
-				// Apply some values from the old statuses as the default values.
-				status.RestartCount = oldStatus.RestartCount
-				status.LastTerminationState = oldStatus.LastTerminationState
-			}
-		}
-		statuses[container.Name] = status
-	}
+	// Initialize container statuses.
+	statuses := kl.initializeContainerStatuses(logger, pod, containers, oldStatuses, hasInitContainers)
 
 	// Reconcile missing runtime statuses using previously reported container states.
 	kl.handleMissingContainerStatuses(pod, podStatus, containers, oldStatuses, statuses, hasInitContainers, podRestarting)
