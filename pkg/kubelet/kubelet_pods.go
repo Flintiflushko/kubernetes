@@ -2328,6 +2328,99 @@ func (kl *Kubelet) convertToAPIPodLevelResourcesStatus(logger klog.Logger, alloc
 	return resources
 }
 
+// handleMissingContainerStatuses reconciles containers absent from the current
+// runtime status with their previously reported state. It preserves termination
+// information and restart counts to avoid incorrectly reporting previously
+// running containers as newly pending.
+func (kl *Kubelet) handleMissingContainerStatuses(pod *v1.Pod, podStatus *kubecontainer.PodStatus, containers []v1.Container, oldStatuses map[string]v1.ContainerStatus, statuses map[string]*v1.ContainerStatus, hasInitContainers bool, podRestarting bool) {
+	for _, container := range containers {
+		found := false
+		for _, cStatus := range podStatus.ContainerStatuses {
+			if container.Name == cStatus.Name {
+				found = true
+				break
+			}
+		}
+		if found {
+			continue
+		}
+		// if no container is found, then assuming it should be waiting seems plausible, but the status code requires
+		// that a previous termination be present.  If we're offline long enough or something removed the container, then
+		// the previous termination may not be present.  This next code block ensures that if the container was previously running
+		// then when that container status disappears, we can infer that it terminated even if we don't know the status code.
+		// By setting the lasttermination state we are able to leave the container status waiting and present more accurate
+		// data via the API.
+
+		oldStatus, ok := oldStatuses[container.Name]
+		if !ok {
+			continue
+		}
+
+		// If the container is missing, RestartAllContainers in place, and previous status is not waiting, then the container
+		// is removed from runtime. It should be considered Waiting. The LastTerminationState should have a "RestartingAllContainers"
+		// reason to avoid confusion when containers are restarted.
+		if utilfeature.DefaultFeatureGate.Enabled(features.RestartAllContainersOnContainerExits) && podRestarting && oldStatus.State.Waiting == nil {
+			status := statuses[container.Name]
+			status.State.Waiting = &v1.ContainerStateWaiting{
+				Reason:  RestartingAllContainers,
+				Message: "The container is removed because RestartAllContainers in place",
+			}
+			status.State.Terminated = nil
+			status.LastTerminationState.Terminated = &v1.ContainerStateTerminated{
+				Reason:   RestartingAllContainers,
+				Message:  "The container is removed because RestartAllContainers in place",
+				ExitCode: 137,
+			}
+			status.RestartCount = oldStatus.RestartCount + 1
+			statuses[container.Name] = status
+			continue
+		}
+
+		if oldStatus.State.Terminated != nil {
+			// if the old container status was terminated, the lasttermination status is correct
+			continue
+		}
+		if oldStatus.State.Running == nil {
+			// if the old container status isn't running, then waiting is an appropriate status and we have nothing to do
+			continue
+		}
+
+		// If we're here, we know the pod was previously running, but doesn't have a terminated status. We will check now to
+		// see if it's in a pending state.
+		status := statuses[container.Name]
+		// If the status we're about to write indicates the default, the Waiting status will force this pod back into Pending.
+		// That isn't true, we know the pod was previously running.
+		isDefaultWaitingStatus := status.State.Waiting != nil && status.State.Waiting.Reason == ContainerCreating
+		if hasInitContainers {
+			isDefaultWaitingStatus = status.State.Waiting != nil && status.State.Waiting.Reason == PodInitializing
+		}
+		if !isDefaultWaitingStatus {
+			// the status was written, don't override
+			continue
+		}
+		if status.LastTerminationState.Terminated != nil {
+			// if we already have a termination state, nothing to do
+			continue
+		}
+
+		// setting this value ensures that we show as stopped here, not as waiting:
+		// https://github.com/kubernetes/kubernetes/blob/90c9f7b3e198e82a756a68ffeac978a00d606e55/pkg/kubelet/kubelet_pods.go#L1440-L1445
+		// This prevents the pod from becoming pending
+		status.LastTerminationState.Terminated = &v1.ContainerStateTerminated{
+			Reason:   kubecontainer.ContainerReasonStatusUnknown,
+			Message:  "The container could not be located when the pod was deleted.  The container used to be Running",
+			ExitCode: 137,
+		}
+
+		// If the pod was not deleted, then it's been restarted. Increment restart count.
+		if pod.DeletionTimestamp == nil {
+			status.RestartCount += 1
+		}
+
+		statuses[container.Name] = status
+	}
+}
+
 // convertToAPIContainerStatuses converts the given internal container
 // statuses into API container statuses.
 func (kl *Kubelet) convertToAPIContainerStatuses(ctx context.Context, pod *v1.Pod, podStatus *kubecontainer.PodStatus, previousStatus []v1.ContainerStatus, containers []v1.Container, imageVolumeNames sets.Set[string], hasInitContainers, isInitContainer bool, podRestarting bool) []v1.ContainerStatus {
@@ -2608,92 +2701,8 @@ func (kl *Kubelet) convertToAPIContainerStatuses(ctx context.Context, pod *v1.Po
 		statuses[container.Name] = status
 	}
 
-	for _, container := range containers {
-		found := false
-		for _, cStatus := range podStatus.ContainerStatuses {
-			if container.Name == cStatus.Name {
-				found = true
-				break
-			}
-		}
-		if found {
-			continue
-		}
-		// if no container is found, then assuming it should be waiting seems plausible, but the status code requires
-		// that a previous termination be present.  If we're offline long enough or something removed the container, then
-		// the previous termination may not be present.  This next code block ensures that if the container was previously running
-		// then when that container status disappears, we can infer that it terminated even if we don't know the status code.
-		// By setting the lasttermination state we are able to leave the container status waiting and present more accurate
-		// data via the API.
-
-		oldStatus, ok := oldStatuses[container.Name]
-		if !ok {
-			continue
-		}
-
-		// If the container is missing, RestartAllContainers in place, and previous status is not waiting, then the container
-		// is removed from runtime. It should be considered Waiting. The LastTerminationState should have a "RestartingAllContainers"
-		// reason to avoid confusion when containers are restarted.
-		if utilfeature.DefaultFeatureGate.Enabled(features.RestartAllContainersOnContainerExits) && podRestarting && oldStatus.State.Waiting == nil {
-			status := statuses[container.Name]
-			status.State.Waiting = &v1.ContainerStateWaiting{
-				Reason:  RestartingAllContainers,
-				Message: "The container is removed because RestartAllContainers in place",
-			}
-			status.State.Terminated = nil
-			status.LastTerminationState.Terminated = &v1.ContainerStateTerminated{
-				Reason:   RestartingAllContainers,
-				Message:  "The container is removed because RestartAllContainers in place",
-				ExitCode: 137,
-			}
-			status.RestartCount = oldStatus.RestartCount + 1
-			statuses[container.Name] = status
-			continue
-		}
-
-		if oldStatus.State.Terminated != nil {
-			// if the old container status was terminated, the lasttermination status is correct
-			continue
-		}
-		if oldStatus.State.Running == nil {
-			// if the old container status isn't running, then waiting is an appropriate status and we have nothing to do
-			continue
-		}
-
-		// If we're here, we know the pod was previously running, but doesn't have a terminated status. We will check now to
-		// see if it's in a pending state.
-		status := statuses[container.Name]
-		// If the status we're about to write indicates the default, the Waiting status will force this pod back into Pending.
-		// That isn't true, we know the pod was previously running.
-		isDefaultWaitingStatus := status.State.Waiting != nil && status.State.Waiting.Reason == ContainerCreating
-		if hasInitContainers {
-			isDefaultWaitingStatus = status.State.Waiting != nil && status.State.Waiting.Reason == PodInitializing
-		}
-		if !isDefaultWaitingStatus {
-			// the status was written, don't override
-			continue
-		}
-		if status.LastTerminationState.Terminated != nil {
-			// if we already have a termination state, nothing to do
-			continue
-		}
-
-		// setting this value ensures that we show as stopped here, not as waiting:
-		// https://github.com/kubernetes/kubernetes/blob/90c9f7b3e198e82a756a68ffeac978a00d606e55/pkg/kubelet/kubelet_pods.go#L1440-L1445
-		// This prevents the pod from becoming pending
-		status.LastTerminationState.Terminated = &v1.ContainerStateTerminated{
-			Reason:   kubecontainer.ContainerReasonStatusUnknown,
-			Message:  "The container could not be located when the pod was deleted.  The container used to be Running",
-			ExitCode: 137,
-		}
-
-		// If the pod was not deleted, then it's been restarted. Increment restart count.
-		if pod.DeletionTimestamp == nil {
-			status.RestartCount += 1
-		}
-
-		statuses[container.Name] = status
-	}
+	// Reconcile missing runtime statuses using previously reported container states.
+	kl.handleMissingContainerStatuses(pod, podStatus, containers, oldStatuses, statuses, hasInitContainers, podRestarting)
 
 	// Copy the slice before sorting it
 	containerStatusesCopy := make([]*kubecontainer.Status, len(podStatus.ContainerStatuses))
